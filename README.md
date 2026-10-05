@@ -97,6 +97,65 @@ An optional top-level `default_brief` changes the no-body preset. Overrides load
 
 ## Architecture
 
+The user journey leads into the component overview. Its **LangGraph book workflow** component expands into the original, unchanged agent-workflow subdiagram below.
+
+```mermaid
+flowchart TD
+    LOGIN["Sign up / sign in"] --> START["Start default UPI or custom book"]
+    START --> WATCH["Watch saved job progress"]
+    WATCH --> REVIEW["Read chapter and review"]
+    REVIEW -- "approve: continue / feedback: revalidate" --> WATCH
+    REVIEW -- "all three approved" --> DOWNLOAD["Download final Markdown / PDF"]
+    WATCH -- "pause between steps" --> PAUSED["Paused: checkpoint retained"]
+    PAUSED -- "resume saved job" --> WATCH
+    REVIEW -- "approved chapter" --> CHAPTER["Read / download chapter Markdown"]
+```
+
+```mermaid
+flowchart TD
+    UI["Browser frontend: HTML / CSS / JavaScript<br/>Served by FastAPI; JWT in per-tab session storage"]
+
+    subgraph SERVICE["Single Docker container: one FastAPI / Uvicorn process"]
+        API["Job / artifact API<br/>Create, poll, pause, resume, review<br/>JWT verification and job-owner checks"]
+        AUTH["Auth: registration key, Argon2 passwords<br/>Sign-up / login; one-hour JWT"]
+        QUEUE["JobService / JobStore<br/>SQLite queue; two background workers"]
+        RECOVERY["Startup recovery<br/>Requeue running jobs; retain pauses and review waits"]
+        subgraph AGENT["LangGraph book workflow"]
+            GRAPH["Research / write / validate / chapter review<br/>Checkpointed interrupts; resume by job ID<br/>Detailed subdiagram below"]
+        end
+        API -- "durable job commands" --> QUEUE
+        QUEUE -- "start / resume with saved decision" --> GRAPH
+        RECOVERY -. "recover saved statuses" .-> QUEUE
+    end
+
+    subgraph DATA["Persistent /data volume"]
+        JOBS[("jobs.sqlite3<br/>Accounts, owned jobs, queue, status, review decisions")]
+        CHECKPOINTS[("checkpoints.sqlite3<br/>Job state, evidence, drafts, feedback<br/>Prompt and research-policy snapshot")]
+        FILES["artifacts / job-id<br/>Approved chapters; final book.md / book.pdf"]
+    end
+
+    CONFIG["Central config: environment + prompt profiles<br/>UPI default / general; BOOK_PROMPTS_FILE overrides"]
+    MODEL["LangChain model client<br/>OpenAI-compatible DeepSeek V4 Flash"]
+    TAVILY["Tavily<br/>Search and source extraction"]
+
+    UI <-->|"job controls / polling / downloads"| API
+    UI <-->|"sign-up / login / bearer token"| AUTH
+    AUTH -- "create / verify account" --> JOBS
+    QUEUE <-->|"claim jobs / save progress and decisions"| JOBS
+    GRAPH <-->|"save / restore isolated job memory"| CHECKPOINTS
+    QUEUE -- "save chapters / render final book" --> FILES
+    API -- "owner-checked artifact read" --> FILES
+    GRAPH <-->|"prompts / responses"| MODEL
+    GRAPH <-->|"queries / evidence"| TAVILY
+    CONFIG -. "validated at startup" .-> API
+    CONFIG -. "snapshot at job execution" .-> GRAPH
+```
+
+Resume and chapter-review decisions go through the authenticated API, durable job queue and workers before continuing the saved graph. The browser receives previews by polling; there is no separate frontend server or message broker. Rejected chapters return to the writer and every validator; approved chapters remain downloadable while the next chapter runs. Signing out or a token expiring leaves saved jobs intact. Provider or validation failures mark a job failed and retain approved chapters.
+
+<details open>
+<summary><strong>Agent workflow subdiagram — original diagram, unchanged</strong></summary>
+
 ```mermaid
 flowchart TD
     API[Authenticated FastAPI] --> Q[SQLite job queue: two workers]
@@ -118,6 +177,8 @@ flowchart TD
     A -- three approved --> B[Final Markdown and PDF]
     Q --- DB[SQLite checkpoints and local artifacts]
 ```
+
+</details>
 
 The UPI profile keeps extractable official NPCI, RBI, and Indian government sources. Other briefs use a topic-neutral profile with public HTTPS sources and an evidence coverage gate that selects authoritative primary material. Operators can restrict domains and supply seed pages for each chapter. The fact checker adds missing citations only when the retrieved excerpt supports the complete sentence; otherwise it removes unsupported sentences. Every repair reruns all validators. A chapter has at most four full writer attempts, three expansions per draft, two focused editor or Takeaway repairs, and 40 review cycles. Exhausting a limit fails the job rather than producing an unchecked final book.
 
