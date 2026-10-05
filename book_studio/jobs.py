@@ -25,7 +25,8 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from book_writer import BookWriter, initial_state, render_book
+from .config import load_profiles
+from .writer import BookWriter, initial_state, render_book
 
 
 LOG = logging.getLogger("book_jobs")
@@ -181,7 +182,7 @@ class JobStore:
 
     def get_job(self, user_id: int, job_id: str) -> dict:
         with self.db() as conn:
-            row = conn.execute("""SELECT id,status,chapter_index,review_chapter,review_preview,
+            row = conn.execute("""SELECT id,brief,status,chapter_index,review_chapter,review_preview,
                 error,created_at,updated_at FROM jobs WHERE id=? AND user_id=?""", (job_id, user_id)).fetchone()
         if row is None:
             raise JobNotFound(job_id)
@@ -189,7 +190,7 @@ class JobStore:
 
     def list_jobs(self, user_id: int, limit: int = 50) -> list[dict]:
         with self.db() as conn:
-            rows = conn.execute("""SELECT id,status,chapter_index,created_at,updated_at
+            rows = conn.execute("""SELECT id,brief,status,chapter_index,created_at,updated_at
                 FROM jobs WHERE user_id=? ORDER BY created_at DESC LIMIT ?""", (user_id, limit)).fetchall()
         return [dict(row) for row in rows]
 
@@ -278,6 +279,7 @@ class JobStore:
 
 class JobService:
     def __init__(self, data_dir: Path, writer_config: dict[str, str], workers: int = 2) -> None:
+        self.profiles = load_profiles(writer_config)
         self.store = JobStore(data_dir)
         self.writer_config = writer_config
         self.workers = workers
@@ -302,7 +304,7 @@ class JobService:
         return bool(self.threads) and all(thread.is_alive() for thread in self.threads)
 
     def _worker_loop(self) -> None:
-        writer = BookWriter(self.writer_config)
+        writer = BookWriter(self.writer_config, self.profiles)
         while not self.stop_event.is_set():
             job = None
             try:
@@ -327,7 +329,10 @@ class JobService:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=30000")
             serde = JsonPlusSerializer(allowed_msgpack_modules=[
-                ("book_writer", "Outline"), ("book_writer", "ChapterPlan"), ("book_writer", "Source")
+                # Preserve checkpoints saved before the backend became a package.
+                ("book_writer", "Outline"), ("book_writer", "ChapterPlan"), ("book_writer", "Source"),
+                ("book_studio.writer", "Outline"), ("book_studio.writer", "ChapterPlan"),
+                ("book_studio.writer", "Source")
             ])
             graph = writer.build_graph(SqliteSaver(conn, serde=serde), self.store.pause_requested, human_review=True)
             config = {"configurable": {"thread_id": job_id}, "recursion_limit": 1000}
@@ -343,7 +348,7 @@ class JobService:
             if len(pending) > 1:
                 raise RuntimeError("Book workflow produced multiple simultaneous interrupts")
             if not snapshot.values:
-                graph_input = initial_state(job["brief"], job_id)
+                graph_input = initial_state(job["brief"], job_id, writer.profile_for(job["brief"]))
             elif pending:
                 payload = pending[0]
                 if payload["kind"] == "pause":

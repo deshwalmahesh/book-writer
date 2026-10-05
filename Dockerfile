@@ -10,9 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends fonts-dejavu-co
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY book_writer.py jobs.py api.py ./
+COPY book_writer.py ./
+COPY book_studio ./book_studio
+COPY static ./static
 
 USER bookwriter
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "book_studio.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

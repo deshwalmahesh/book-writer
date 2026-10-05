@@ -2,30 +2,22 @@
 
 from __future__ import annotations
 
-import os
 import logging
 import secrets
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
-import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Path as ApiPath, Query, Request
 from fastapi.responses import FileResponse
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jwt.exceptions import InvalidTokenError
-from pwdlib import PasswordHash
-from pydantic import BaseModel, Field, model_validator
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from book_writer import DEFAULT_BRIEF, load_config
-from jobs import ARTIFACT_NAMES, JobConflict, JobNotFound, JobService
-
-
-PASSWORD_HASH = PasswordHash.recommended()
-DUMMY_HASH = PASSWORD_HASH.hash("missing-user-password")
-BEARER = OAuth2PasswordBearer(tokenUrl="/auth/token")
+from .auth import DUMMY_HASH, PASSWORD_HASH, access_token, current_user
+from .config import STATIC_DIR, load_service_config
+from .jobs import ARTIFACT_NAMES, JobConflict, JobNotFound, JobService
 
 
 class Registration(BaseModel):
@@ -59,6 +51,7 @@ class ReviewRequest(BaseModel):
 
 class JobSummary(BaseModel):
     id: str
+    brief: str
     status: str
     chapter_index: int
     created_at: str
@@ -71,14 +64,25 @@ class JobDetail(JobSummary):
     error: str | None
 
 
+class BookRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    brief: str | None = Field(default=None, max_length=20000)
+
+    @model_validator(mode="after")
+    def check_brief(self) -> "BookRequest":
+        if self.brief is not None:
+            self.brief = self.brief.strip()
+            if not self.brief:
+                raise ValueError("Book brief must not be blank")
+        return self
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    config = load_config(Path(os.environ.get("BOOK_ENV_FILE", ".env")))
+    config = load_service_config()
     jwt_secret = config.get("JWT_SECRET", "")
     registration_key = config.get("REGISTRATION_KEY", "")
-    if len(jwt_secret) < 32 or len(registration_key) < 32:
-        raise RuntimeError("JWT_SECRET and REGISTRATION_KEY must each contain at least 32 characters")
     service = JobService(Path(config.get("DATA_DIR", "data")), config)
     app.state.service = service
     app.state.jwt_secret = jwt_secret
@@ -91,6 +95,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Book Writer", version="1.0", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def workspace() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html", headers={
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+        "frame-ancestors 'none'; form-action 'self'",
+    })
 
 
 @app.exception_handler(JobNotFound)
@@ -105,25 +121,6 @@ async def conflict_handler(request: Request, exc: JobConflict):
 
 def service_for(request: Request) -> JobService:
     return request.app.state.service
-
-
-def current_user(
-    request: Request,
-    token: Annotated[str, Depends(BEARER)],
-    service: Annotated[JobService, Depends(service_for)],
-) -> dict:
-    unauthorized = HTTPException(status_code=401, detail="Invalid or expired credentials",
-                                 headers={"WWW-Authenticate": "Bearer"})
-    try:
-        payload = jwt.decode(token, request.app.state.jwt_secret, algorithms=["HS256"],
-                             options={"require": ["sub", "exp"]})
-        user_id = int(payload["sub"])
-    except (InvalidTokenError, ValueError, TypeError, KeyError) as exc:
-        raise unauthorized from exc
-    user = service.store.user_by_id(user_id)
-    if user is None:
-        raise unauthorized
-    return user
 
 
 @app.get("/health")
@@ -167,9 +164,7 @@ def login(
     if user is None or not PASSWORD_HASH.verify(form.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect username or password",
                             headers={"WWW-Authenticate": "Bearer"})
-    expires = datetime.now(timezone.utc) + timedelta(hours=1)
-    token = jwt.encode({"sub": str(user["id"]), "exp": expires}, request.app.state.jwt_secret,
-                       algorithm="HS256")
+    token = access_token(user["id"], request.app.state.jwt_secret)
     return {"access_token": token, "token_type": "bearer"}
 
 
@@ -182,8 +177,10 @@ def me(user: Annotated[dict, Depends(current_user)]) -> dict:
 def create_job(
     user: Annotated[dict, Depends(current_user)],
     service: Annotated[JobService, Depends(service_for)],
+    payload: BookRequest | None = None,
 ) -> dict:
-    job_id = service.store.create_job(user["id"], DEFAULT_BRIEF)
+    brief = payload.brief if payload and payload.brief is not None else service.profiles["default_brief"]
+    job_id = service.store.create_job(user["id"], brief)
     return service.store.get_job(user["id"], job_id)
 
 
