@@ -1,0 +1,10 @@
+*
+!.gitignore
+!.dockerignore
+!Dockerfile
+!requirements.txt
+!README.md
+!book_writer.py
+!jobs.py
+!api.py
+!book.md
